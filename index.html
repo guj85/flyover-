@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Flyover</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.3/build/mp4-muxer.js"></script>
+<style>
+  :root { --bg:#0f1419; --panel:#182029; --line:#26313b; --text:#e8edf2; --muted:#8a96a3; --accent:#fc5200; }
+  * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
+  html,body { margin:0; background:var(--bg); color:var(--text);
+    font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  .app { max-width:980px; margin:0 auto; padding:12px 16px 32px; display:grid; gap:14px; }
+  @media (min-width:860px){ .app { grid-template-columns: 1fr 300px; align-items:start; } }
+  h1 { font-size:20px; margin:4px 0 0; grid-column:1/-1; }
+  h1 span { color:var(--accent); }
+  .stage-wrap { display:flex; justify-content:center; }
+  .stage { position:relative; background:#000; border-radius:12px; overflow:hidden; }
+  #map, #hud { position:absolute; inset:0; width:100%; height:100%; }
+  #hud { pointer-events:none; }
+  .empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    text-align:center; padding:24px; color:var(--muted); z-index:3; background:var(--bg); }
+  .panel { background:var(--panel); border-radius:12px; padding:14px; display:grid; gap:12px; }
+  label { display:grid; gap:4px; font-size:13px; color:var(--muted); }
+  input[type=text], select { width:100%; padding:9px 10px; border-radius:8px; border:1px solid var(--line);
+    background:var(--bg); color:var(--text); font:inherit; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  button, .file { appearance:none; border:0; border-radius:8px; padding:11px 12px; font:inherit; font-weight:600;
+    cursor:pointer; background:var(--line); color:var(--text); text-align:center; }
+  button.primary { background:var(--accent); color:#fff; }
+  button:disabled { opacity:.45; cursor:default; }
+  .file input { display:none; }
+  .progress { height:6px; background:var(--line); border-radius:3px; overflow:hidden; }
+  .progress div { height:100%; width:0; background:var(--accent); transition:width .2s; }
+  #status { font-size:13px; color:var(--muted); min-height:1.4em; }
+  a { color:var(--accent); }
+  .note { font-size:12px; color:var(--muted); }
+  video { width:100%; border-radius:8px; background:#000; }
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>Fly<span>over</span></h1>
+
+  <div class="stage-wrap"><div class="stage" id="stage">
+    <div id="map"></div>
+    <canvas id="hud"></canvas>
+    <div class="empty" id="empty">GPX-Datei auswählen</div>
+  </div></div>
+
+  <div class="panel">
+    <label class="file">GPX wählen<input type="file" id="gpx" accept=".gpx,application/gpx+xml,application/xml,text/xml"></label>
+    <label>Titel <input type="text" id="title" placeholder="Morning Ride"></label>
+    <label>Untertitel <input type="text" id="sub" placeholder="3. Oktober 2026 · Stockheim"></label>
+    <div class="row">
+      <label>Format
+        <select id="fmt">
+          <option value="1080x1920">Hochformat 9:16</option>
+          <option value="1080x1080">Quadrat 1:1</option>
+          <option value="1920x1080">Querformat 16:9</option>
+        </select>
+      </label>
+      <label>Länge
+        <select id="dur">
+          <option value="20">20 s</option>
+          <option value="30" selected>30 s</option>
+          <option value="45">45 s</option>
+          <option value="60">60 s</option>
+        </select>
+      </label>
+    </div>
+    <div class="row">
+      <button id="play" disabled>Vorschau</button>
+      <button id="rec" class="primary" disabled>Video erstellen</button>
+    </div>
+    <div class="progress"><div id="bar"></div></div>
+    <div id="status"></div>
+    <div id="out" hidden>
+      <video id="vid" controls playsinline></video>
+      <div class="row" style="margin-top:8px">
+        <button id="share" class="primary">Teilen</button>
+        <button id="save">Speichern</button>
+      </div>
+    </div>
+    <div class="note">Satellitenbilder: Esri, Maxar, Earthstar Geographics · Gelände: Mapzen/AWS Terrain Tiles.
+      Höhenangaben aus der GPX-Datei. Alles läuft lokal im Browser.</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const FPS = 30;
+const ACCENT = "#fc5200";
+
+/* ---------- Karte ---------- */
+let OUT_W = 1080, OUT_H = 1920;
+let map, route = null, mapReady = false, busy = false;
+
+function stageSize() {
+  const maxW = Math.min(document.querySelector(".stage-wrap").clientWidth, 620);
+  const maxH = Math.max(320, window.innerHeight * 0.72);
+  const s = Math.min(maxW / OUT_W, maxH / OUT_H);
+  return [Math.round(OUT_W * s), Math.round(OUT_H * s)];
+}
+function layoutStage() {
+  const [w, h] = stageSize();
+  const st = $("stage"); st.style.width = w + "px"; st.style.height = h + "px";
+  const hud = $("hud"); hud.width = OUT_W; hud.height = OUT_H;
+  if (map) { map.setPixelRatio(OUT_W / w); map.resize(); }
+  drawHud(lastState);
+}
+
+function initMap() {
+  layoutStage();
+  const [w] = stageSize();
+  map = new maplibregl.Map({
+    container: "map",
+    pixelRatio: OUT_W / w,
+    preserveDrawingBuffer: true,
+    attributionControl: false,
+    interactive: true,
+    maxPitch: 75,
+    center: [11.28, 50.28], zoom: 9,
+    style: {
+      version: 8,
+      sources: {
+        sat: { type: "raster", tileSize: 256, maxzoom: 18,
+          tiles: ["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"] },
+        dem: { type: "raster-dem", tileSize: 256, maxzoom: 14, encoding: "terrarium",
+          tiles: ["https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"] },
+        full: { type: "geojson", data: emptyLine() },
+        done: { type: "geojson", data: emptyLine() },
+        rider: { type: "geojson", data: { type: "FeatureCollection", features: [] } }
+      },
+      layers: [
+        { id: "sat", type: "raster", source: "sat",
+          paint: { "raster-saturation": -0.1, "raster-contrast": 0.08 } },
+        { id: "full-casing", type: "line", source: "full",
+          layout: { "line-cap": "round", "line-join": "round" },
+          paint: { "line-color": "#000", "line-opacity": 0.35, "line-width": 7 } },
+        { id: "full", type: "line", source: "full",
+          layout: { "line-cap": "round", "line-join": "round" },
+          paint: { "line-color": "#ffffff", "line-opacity": 0.75, "line-width": 3.5 } },
+        { id: "done", type: "line", source: "done",
+          layout: { "line-cap": "round", "line-join": "round" },
+          paint: { "line-color": ACCENT, "line-width": 6 } },
+        { id: "rider-halo", type: "circle", source: "rider",
+          paint: { "circle-radius": 16, "circle-color": ACCENT, "circle-opacity": 0.3 } },
+        { id: "rider", type: "circle", source: "rider",
+          paint: { "circle-radius": 8, "circle-color": "#fff",
+                   "circle-stroke-color": ACCENT, "circle-stroke-width": 4 } }
+      ],
+      sky: { "sky-color": "#7fb2e8", "horizon-color": "#d9e6f2", "fog-color": "#d9e6f2",
+             "sky-horizon-blend": 0.6, "horizon-fog-blend": 0.6, "fog-ground-blend": 0.3 }
+    }
+  });
+  map.on("load", () => {
+    map.setTerrain({ source: "dem", exaggeration: 1.6 });
+    mapReady = true;
+    if (route) showRoute();
+  });
+}
+const emptyLine = () => ({ type: "Feature", geometry: { type: "LineString", coordinates: [] }, properties: {} });
+const line = c => ({ type: "Feature", geometry: { type: "LineString", coordinates: c }, properties: {} });
+
+/* ---------- GPX ---------- */
+function parseGpx(text) {
+  const doc = new DOMParser().parseFromString(text, "application/xml");
+  let pts = [...doc.querySelectorAll("trkpt")];
+  if (!pts.length) pts = [...doc.querySelectorAll("rtept")];
+  if (pts.length < 2) throw new Error("Keine Trackpunkte gefunden");
+  let raw = pts.map(p => ({
+    lat: +p.getAttribute("lat"), lon: +p.getAttribute("lon"),
+    ele: p.querySelector("ele") ? +p.querySelector("ele").textContent : NaN,
+    t: p.querySelector("time") ? Date.parse(p.querySelector("time").textContent) : NaN
+  })).filter(p => isFinite(p.lat) && isFinite(p.lon));
+  const step = Math.ceil(raw.length / 6000);
+  if (step > 1) raw = raw.filter((_, i) => i % step === 0 || i === raw.length - 1);
+  const nameEl = doc.querySelector("trk > name") || doc.querySelector("metadata > name");
+  return { pts: raw, name: nameEl ? nameEl.textContent.trim() : "" };
+}
+
+function hav(a, b) {
+  const R = 6371000, r = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * r, dLon = (b.lon - a.lon) * r;
+  const s = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
+}
+
+function buildRoute({ pts, name }) {
+  const n = pts.length, dist = new Float64Array(n);
+  for (let i = 1; i < n; i++) dist[i] = dist[i - 1] + hav(pts[i - 1], pts[i]);
+  const hasEle = pts.some(p => isFinite(p.ele));
+  const ele = pts.map(p => isFinite(p.ele) ? p.ele : 0);
+  // geglättete Höhe für Höhenmeter
+  let gain = 0, prev = null;
+  for (let i = 0; i < n; i++) {
+    let s = 0, c = 0;
+    for (let k = Math.max(0, i - 3); k <= Math.min(n - 1, i + 3); k++) { s += ele[k]; c++; }
+    const v = s / c;
+    if (prev !== null && v > prev) gain += v - prev;
+    prev = v;
+  }
+  // geglättete Position für die Kamera (Fenster ~300 m)
+  const sm = pts.map((_, i) => {
+    let lo = i, hi = i;
+    while (lo > 0 && dist[i] - dist[lo - 1] < 150) lo--;
+    while (hi < n - 1 && dist[hi + 1] - dist[i] < 150) hi++;
+    let la = 0, ln = 0;
+    for (let k = lo; k <= hi; k++) { la += pts[k].lat; ln += pts[k].lon; }
+    return { lat: la / (hi - lo + 1), lon: ln / (hi - lo + 1) };
+  });
+  const t0 = pts[0].t, t1 = pts[n - 1].t;
+  return { pts, sm, dist, ele, hasEle, gain, total: dist[n - 1], name,
+           start: isFinite(t0) ? new Date(t0) : null,
+           duration: isFinite(t0) && isFinite(t1) ? (t1 - t0) / 1000 : null,
+           coords: pts.map(p => [p.lon, p.lat]) };
+}
+
+function idxAt(d) {   // binäre Suche nach Distanz
+  const D = route.dist; let lo = 0, hi = D.length - 1;
+  if (d <= 0) return [0, 0]; if (d >= D[hi]) return [hi - 1, 1];
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (D[m] <= d) lo = m; else hi = m; }
+  return [lo, (d - D[lo]) / (D[hi] - D[lo] || 1)];
+}
+function at(arr, d) {
+  const [i, f] = idxAt(d), a = arr[i], b = arr[Math.min(i + 1, arr.length - 1)];
+  return { lat: a.lat + (b.lat - a.lat) * f, lon: a.lon + (b.lon - a.lon) * f };
+}
+function eleAt(d) { const [i, f] = idxAt(d), E = route.ele; return E[i] + (E[Math.min(i + 1, E.length - 1)] - E[i]) * f; }
+function bearing(a, b) {
+  const r = Math.PI / 180, y = Math.sin((b.lon - a.lon) * r) * Math.cos(b.lat * r);
+  const x = Math.cos(a.lat * r) * Math.sin(b.lat * r) - Math.sin(a.lat * r) * Math.cos(b.lat * r) * Math.cos((b.lon - a.lon) * r);
+  return Math.atan2(y, x) / r;
+}
+
+function bounds() {
+  const b = new maplibregl.LngLatBounds();
+  route.coords.forEach(c => b.extend(c)); return b;
+}
+
+function showRoute() {
+  map.getSource("full").setData(line(route.coords));
+  map.getSource("done").setData(emptyLine());
+  map.getSource("rider").setData({ type: "FeatureCollection", features: [] });
+  const c = map.cameraForBounds(bounds(), { padding: padFor() });
+  map.jumpTo({ center: c.center, zoom: c.zoom, pitch: 0, bearing: 0 });
+  $("empty").hidden = true;
+  $("play").disabled = $("rec").disabled = false;
+  lastState = { p: 0, phase: "intro", fade: 0 };
+  drawHud(lastState);
+}
+function padFor() {
+  const h = $("stage").clientHeight, w = $("stage").clientWidth;
+  return { top: h * 0.24, bottom: h * 0.22, left: w * 0.08, right: w * 0.08 };
+}
+
+async function loadText(text) {
+  try {
+    route = buildRoute(parseGpx(text));
+    if (!$("title").value) $("title").value = route.name || "Meine Tour";
+    if (!$("sub").value && route.start)
+      $("sub").value = route.start.toLocaleDateString("de-DE", { day: "numeric", month: "long", year: "numeric" });
+    status(`${(route.total / 1000).toFixed(1).replace(".", ",")} km · ${Math.round(route.gain)} Hm geladen.`);
+    if (mapReady) showRoute();
+  } catch (e) { status("Fehler: " + e.message); }
+}
+
+/* ---------- Kamera ---------- */
+const INTRO = 2.5, OUTRO = 4.0, HOLD = 1.5;
+const ease = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const lerp = (a, b, t) => a + (b - a) * t;
+const wrap = a => ((a + 540) % 360) - 180;
+let camBearing = 0, overview = null;
+
+function followCam(d) {
+  const target = at(route.sm, d);
+  const back = at(route.sm, Math.max(0, d - 250)), ahead = at(route.sm, Math.min(route.total, d + 700));
+  const b = bearing(back, ahead);
+  const km = route.total / 1000;
+  const zoom = Math.max(12.6, Math.min(14.8, 15.0 - Math.log2(Math.max(km, 5) / 10) * 0.55));
+  return { center: [target.lon, target.lat], zoom, pitch: 62, bearingTarget: b };
+}
+
+function totalSeconds() { return +$("dur").value + INTRO + OUTRO + HOLD; }
+
+// liefert Zustand für Zeitpunkt t (s); stetig, deterministisch bei sequentiellem Aufruf
+function frameAt(t, dt) {
+  const ride = +$("dur").value;
+  let cam, p, phase, fade = 0, padK = 0;
+  if (t < INTRO) {
+    const k = ease(t / INTRO), f = followCam(0);
+    if (t === 0) camBearing = 0;
+    cam = { center: [lerp(overview.center.lng, f.center[0], k), lerp(overview.center.lat, f.center[1], k)],
+            zoom: lerp(overview.zoom, f.zoom, k), pitch: lerp(0, f.pitch, k),
+            bearing: lerp(0, f.bearingTarget, k) };
+    camBearing = cam.bearing; p = 0; phase = "intro"; padK = k;
+  } else if (t < INTRO + ride) {
+    p = (t - INTRO) / ride;
+    const f = followCam(p * route.total);
+    camBearing = wrap(camBearing + wrap(f.bearingTarget - camBearing) * Math.min(1, dt * 1.6));
+    cam = { center: f.center, zoom: f.zoom, pitch: f.pitch, bearing: camBearing };
+    phase = "ride"; padK = 1;
+  } else {
+    const k = ease(Math.min(1, (t - INTRO - ride) / OUTRO)), f = followCam(route.total);
+    cam = { center: [lerp(f.center[0], overview.center.lng, k), lerp(f.center[1], overview.center.lat, k)],
+            zoom: lerp(f.zoom, overview.zoom - 0.25, k), pitch: lerp(f.pitch, 45, k),
+            bearing: camBearingOutro + k * 40 };
+    p = 1; phase = "outro"; fade = k; padK = 1 - k;
+  }
+  if (phase !== "outro") camBearingOutro = camBearing;
+  return { cam, p, phase, fade, padK };
+}
+let camBearingOutro = 0;
+
+function applyFrame(s) {
+  const top = $("stage").clientHeight * 0.32 * (s.padK || 0);
+  map.jumpTo({ ...s.cam, padding: { top, bottom: 0, left: 0, right: 0 } });
+  // Kamera-Mittelpunkt auf Geländehöhe setzen, sonst sitzt der Fahrer nicht in der Bildmitte
+  if (map.terrain) {
+    map._elevationFreeze = false;
+    map.transform.elevation = map.terrain.getElevationForLngLatZoom(
+      maplibregl.LngLat.convert(s.cam.center), map.transform.tileZoom);
+  }
+  const d = s.p * route.total, [i] = idxAt(d), pos = at(route.pts, d);
+  const done = route.coords.slice(0, i + 1); done.push([pos.lon, pos.lat]);
+  map.getSource("done").setData(line(done));
+  map.getSource("rider").setData({ type: "Feature", geometry: { type: "Point", coordinates: [pos.lon, pos.lat] }, properties: {} });
+  lastState = s; drawHud(s);
+}
+
+/* ---------- HUD ---------- */
+let lastState = null;
+function fmtKm(m) { return (m / 1000).toFixed(1).replace(".", ","); }
+function fmtDur(s) { const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60); return `${h}:${String(m).padStart(2, "0")} h`; }
+
+function drawHud(s) {
+  const c = $("hud"), g = c.getContext("2d"), W = c.width, H = c.height;
+  g.clearRect(0, 0, W, H);
+  if (!route || !s) return;
+  const u = Math.min(W, H) / 1080;            // Skalierung
+  const pad = 64 * u;
+  // obere Abdunklung
+  let gr = g.createLinearGradient(0, 0, 0, 420 * u);
+  gr.addColorStop(0, "rgba(10,14,18,.78)"); gr.addColorStop(1, "rgba(10,14,18,0)");
+  g.fillStyle = gr; g.fillRect(0, 0, W, 420 * u);
+  // untere Abdunklung
+  const botH = 360 * u;
+  gr = g.createLinearGradient(0, H - botH, 0, H);
+  gr.addColorStop(0, "rgba(10,14,18,0)"); gr.addColorStop(1, "rgba(10,14,18,.85)");
+  g.fillStyle = gr; g.fillRect(0, H - botH, W, botH);
+
+  const font = (w, px) => `${w} ${px * u}px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif`;
+  g.textBaseline = "alphabetic"; g.fillStyle = "#fff";
+  g.shadowColor = "rgba(0,0,0,.5)"; g.shadowBlur = 8 * u;
+  g.font = font(800, 58); g.fillText($("title").value || route.name || "Meine Tour", pad, pad + 50 * u);
+  g.font = font(500, 30); g.fillStyle = "rgba(255,255,255,.75)";
+  g.fillText($("sub").value || "", pad, pad + 95 * u);
+
+  const d = s.p * route.total;
+  g.fillStyle = "#fff"; g.font = font(800, 56);
+  g.fillText(`${fmtKm(d)} km`, pad, pad + 185 * u);
+  if (route.hasEle) g.fillText(`${Math.round(eleAt(d))} m`, pad + 380 * u, pad + 185 * u);
+  g.font = font(600, 22); g.fillStyle = "rgba(255,255,255,.65)";
+  g.fillText("DISTANZ", pad, pad + 218 * u);
+  if (route.hasEle) g.fillText("HÖHE", pad + 380 * u, pad + 218 * u);
+  g.shadowBlur = 0;
+
+  // Höhenprofil
+  if (route.hasEle) {
+    const x0 = pad, x1 = W - pad, y1 = H - 70 * u, y0 = y1 - 150 * u;
+    let mn = Infinity, mx = -Infinity; route.ele.forEach(e => { mn = Math.min(mn, e); mx = Math.max(mx, e); });
+    const rng = Math.max(mx - mn, 50); mn -= rng * 0.08;
+    const X = dd => x0 + (x1 - x0) * dd / route.total, Y = e => y1 - (y1 - y0) * (e - mn) / (mx - mn);
+    const path = (upto) => {
+      g.beginPath(); g.moveTo(X(0), y1);
+      for (let i = 0; i < route.dist.length && route.dist[i] <= upto; i += 2) g.lineTo(X(route.dist[i]), Y(route.ele[i]));
+      g.lineTo(X(upto), Y(eleAt(upto))); g.lineTo(X(upto), y1); g.closePath();
+    };
+    path(route.total); g.fillStyle = "rgba(255,255,255,.22)"; g.fill();
+    if (d > 0) { path(d); g.fillStyle = ACCENT; g.fill(); }
+    g.beginPath(); g.arc(X(d), Y(eleAt(d)), 9 * u, 0, Math.PI * 2);
+    g.fillStyle = "#fff"; g.fill(); g.lineWidth = 4 * u; g.strokeStyle = ACCENT; g.stroke();
+  }
+  // Abschluss
+  if (s.fade > 0) {
+    const parts = [`${fmtKm(route.total)} km`];
+    if (route.hasEle) parts.push(`${Math.round(route.gain)} Hm`);
+    if (route.duration) parts.push(fmtDur(route.duration));
+    g.globalAlpha = Math.min(1, s.fade * 1.5);
+    g.font = font(800, 46); g.textAlign = "center"; g.fillStyle = "#fff";
+    g.shadowColor = "rgba(0,0,0,.6)"; g.shadowBlur = 12 * u;
+    g.fillText(parts.join("  ·  "), W / 2, H - (route.hasEle ? 270 : 120) * u);
+    g.globalAlpha = 1; g.textAlign = "left"; g.shadowBlur = 0;
+  }
+  g.font = font(500, 16); g.fillStyle = "rgba(255,255,255,.55)"; g.textAlign = "right";
+  g.fillText("Bilder © Esri, Maxar, Earthstar Geographics", W - pad, H - 24 * u);
+  g.textAlign = "left";
+}
+
+/* ---------- Vorschau ---------- */
+let playing = false;
+function computeOverview() {
+  const c = map.cameraForBounds(bounds(), { padding: padFor() });
+  overview = { center: maplibregl.LngLat.convert(c.center), zoom: c.zoom };
+}
+function preview() {
+  if (playing) { playing = false; return; }
+  computeOverview();
+  playing = true; $("play").textContent = "Stopp"; $("rec").disabled = true;
+  const T = totalSeconds(); let t0 = null, last = 0;
+  const step = now => {
+    if (!playing) return done();
+    if (t0 === null) t0 = now;
+    const t = Math.min(T, (now - t0) / 1000);
+    applyFrame(frameAt(t, t - last)); last = t;
+    setBar(t / T);
+    if (t >= T) return done();
+    requestAnimationFrame(step);
+  };
+  const done = () => { playing = false; $("play").textContent = "Vorschau"; $("rec").disabled = false; };
+  requestAnimationFrame(step);
+}
+
+/* ---------- Video rendern ---------- */
+function settle(timeout = 5000) {
+  return new Promise(res => {
+    let fin = false; const f = () => { if (!fin) { fin = true; res(); } };
+    map.once("idle", f); setTimeout(f, timeout); map.triggerRepaint();
+  });
+}
+async function pickCodec(w, h) {
+  for (const codec of ["avc1.640028", "avc1.4d0028", "avc1.640033", "avc1.42003e"]) {
+    const cfg = { codec, width: w, height: h, bitrate: 10e6, framerate: FPS, avc: { format: "avc" } };
+    try { if ((await VideoEncoder.isConfigSupported(cfg)).supported) return cfg; } catch (e) {}
+  }
+  return null;
+}
+
+async function render() {
+  if (busy) return;
+  if (typeof VideoEncoder === "undefined") {
+    status("Dieser Browser kann kein Video erzeugen. Bitte aktuelles Chrome, Edge oder Safari (iOS 16.4+) nutzen – oder die Vorschau per Bildschirmaufnahme aufnehmen.");
+    return;
+  }
+  busy = true; $("rec").disabled = $("play").disabled = true; $("out").hidden = true;
+  const cfg = await pickCodec(OUT_W, OUT_H);
+  if (!cfg) { status("H.264-Encoder nicht verfügbar."); busy = false; $("rec").disabled = $("play").disabled = false; return; }
+
+  computeOverview();
+  const muxer = new Mp4Muxer.Muxer({ target: new Mp4Muxer.ArrayBufferTarget(),
+    video: { codec: "avc", width: OUT_W, height: OUT_H, frameRate: FPS }, fastStart: "in-memory" });
+  let encErr = null;
+  const enc = new VideoEncoder({ output: (ch, meta) => muxer.addVideoChunk(ch, meta), error: e => encErr = e });
+  enc.configure(cfg);
+
+  const comp = document.createElement("canvas"); comp.width = OUT_W; comp.height = OUT_H;
+  const cg = comp.getContext("2d");
+  const T = totalSeconds(), N = Math.round(T * FPS), started = performance.now();
+
+  // Startansicht vorladen
+  applyFrame(frameAt(0, 0)); await settle(8000);
+
+  for (let f = 0; f < N; f++) {
+    if (encErr) break;
+    const t = f / FPS;
+    applyFrame(frameAt(t, 1 / FPS));
+    await settle();
+    cg.drawImage(map.getCanvas(), 0, 0, OUT_W, OUT_H);
+    cg.drawImage($("hud"), 0, 0);
+    const vf = new VideoFrame(comp, { timestamp: Math.round(f * 1e6 / FPS), duration: Math.round(1e6 / FPS) });
+    enc.encode(vf, { keyFrame: f % (FPS * 2) === 0 }); vf.close();
+    while (enc.encodeQueueSize > 4) await new Promise(r => setTimeout(r, 5));
+    if (f % 5 === 0) {
+      const el = (performance.now() - started) / 1000, rest = el / (f + 1) * (N - f - 1);
+      status(`Rendere Bild ${f + 1} von ${N} · noch ca. ${Math.ceil(rest / 60)} min`);
+      setBar((f + 1) / N);
+    }
+  }
+  if (encErr) { status("Encoder-Fehler: " + encErr.message); busy = false; $("rec").disabled = $("play").disabled = false; return; }
+  await enc.flush(); enc.close(); muxer.finalize();
+  const blob = new Blob([muxer.target.buffer], { type: "video/mp4" });
+  showResult(blob);
+  busy = false; $("rec").disabled = $("play").disabled = false;
+}
+
+let resultFile = null;
+function showResult(blob) {
+  const name = (($("title").value || "flyover").replace(/[^\wäöüÄÖÜß-]+/g, "_")) + ".mp4";
+  resultFile = new File([blob], name, { type: "video/mp4" });
+  $("vid").src = URL.createObjectURL(blob);
+  $("out").hidden = false;
+  $("share").hidden = !(navigator.canShare && navigator.canShare({ files: [resultFile] }));
+  status(`Fertig: ${(blob.size / 1e6).toFixed(1).replace(".", ",")} MB`);
+  setBar(1);
+}
+$("share").onclick = () => navigator.share({ files: [resultFile], title: $("title").value }).catch(() => {});
+$("save").onclick = () => {
+  const a = document.createElement("a"); a.href = URL.createObjectURL(resultFile);
+  a.download = resultFile.name; document.body.appendChild(a); a.click(); a.remove();
+};
+
+/* ---------- UI ---------- */
+function status(t) { $("status").textContent = t; }
+function setBar(f) { $("bar").style.width = (f * 100).toFixed(1) + "%"; }
+
+$("gpx").onchange = e => { const f = e.target.files[0]; if (f) f.text().then(loadText); };
+$("play").onclick = preview;
+$("rec").onclick = render;
+$("fmt").onchange = () => {
+  [OUT_W, OUT_H] = $("fmt").value.split("x").map(Number);
+  layoutStage(); if (route && mapReady) showRoute();
+};
+["title", "sub"].forEach(id => $(id).oninput = () => drawHud(lastState));
+window.addEventListener("resize", () => { if (!busy && !playing) layoutStage(); });
+
+initMap();
+</script>
+</body>
+</html>
