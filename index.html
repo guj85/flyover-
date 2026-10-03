@@ -73,6 +73,20 @@
       </label>
     </div>
     <div class="row">
+      <label>Qualität
+        <select id="q">
+          <option value="720" selected>720p (Handy)</option>
+          <option value="1080">1080p</option>
+        </select>
+      </label>
+      <label>Ortsnamen
+        <select id="labels">
+          <option value="on" selected>einblenden</option>
+          <option value="off">aus</option>
+        </select>
+      </label>
+    </div>
+    <div class="row">
       <button id="play" disabled>Vorschau</button>
       <button id="rec" class="primary" disabled>Video erstellen</button>
     </div>
@@ -85,7 +99,8 @@
         <button id="save">Speichern</button>
       </div>
     </div>
-    <div class="note">Satellitenbilder: Esri, Maxar, Earthstar Geographics · Gelände: Mapzen/AWS Terrain Tiles.
+    <div class="note">Satellitenbilder: Esri, Maxar, Earthstar Geographics · Gelände: Mapzen/AWS Terrain Tiles ·
+      Ortsnamen: © OpenStreetMap, OpenFreeMap.<br>Während „Video erstellen“ die Seite im Vordergrund lassen.
       Höhenangaben aus der GPX-Datei. Alles läuft lokal im Browser.</div>
   </div>
 </div>
@@ -97,7 +112,11 @@ const FPS = 30;
 const ACCENT = "#fc5200";
 
 /* ---------- Karte ---------- */
-let OUT_W = 1080, OUT_H = 1920;
+let OUT_W = 720, OUT_H = 1280;
+function setDims() {
+  const [w, h] = $("fmt").value.split("x").map(Number), k = +$("q").value / 1080;
+  OUT_W = Math.round(w * k / 2) * 2; OUT_H = Math.round(h * k / 2) * 2;
+}
 let map, route = null, mapReady = false, busy = false;
 
 function stageSize() {
@@ -121,12 +140,14 @@ function initMap() {
     container: "map",
     pixelRatio: OUT_W / w,
     preserveDrawingBuffer: true,
+    fadeDuration: 0,
     attributionControl: false,
     interactive: true,
     maxPitch: 75,
     center: [11.28, 50.28], zoom: 9,
     style: {
       version: 8,
+      glyphs: "https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf",
       sources: {
         sat: { type: "raster", tileSize: 256, maxzoom: 18,
           tiles: ["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"] },
@@ -160,10 +181,27 @@ function initMap() {
   });
   map.on("load", () => {
     map.setTerrain({ source: "dem", exaggeration: 1.6 });
+    // Ortsnamen getrennt hinzufügen: fällt der Dienst aus, läuft der Rest trotzdem
+    try {
+      map.addSource("omt", { type: "vector", url: "https://tiles.openfreemap.org/planet" });
+      map.addLayer(PLACES_LAYER);
+      $("labels").onchange();
+    } catch (e) { console.warn("Ortsnamen nicht verfügbar", e); }
     mapReady = true;
     if (route) showRoute();
   });
 }
+const PLACES_LAYER =
+{ id: "places", type: "symbol", source: "omt", "source-layer": "place",
+          filter: ["in", ["get", "class"], ["literal", ["city", "town", "village"]]],
+          layout: {
+            "text-field": ["coalesce", ["get", "name:de"], ["get", "name"]],
+            "text-font": ["Noto Sans Bold"],
+            "text-size": ["match", ["get", "class"], "city", 22, "town", 19, 16],
+            "text-padding": 6, "text-max-width": 8,
+            "text-variable-anchor": ["top", "bottom", "left", "right"], "text-radial-offset": 0.4
+          },
+          paint: { "text-color": "#ffffff", "text-halo-color": "rgba(0,0,0,.75)", "text-halo-width": 1.6 } };
 const emptyLine = () => ({ type: "Feature", geometry: { type: "LineString", coordinates: [] }, properties: {} });
 const line = c => ({ type: "Feature", geometry: { type: "LineString", coordinates: c }, properties: {} });
 
@@ -427,29 +465,60 @@ function preview() {
 }
 
 /* ---------- Video rendern ---------- */
-function settle(timeout = 5000) {
-  return new Promise(res => {
-    let fin = false; const f = () => { if (!fin) { fin = true; res(); } };
-    map.once("idle", f); setTimeout(f, timeout); map.triggerRepaint();
-  });
+let wakeLock = null, ctxLost = false, cancelReq = false, settleMisses = 0;
+async function keepAwake(on) {
+  try {
+    if (on && "wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
+    else if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; }
+  } catch (e) {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (busy && document.visibilityState === "visible") keepAwake(true);
+});
+function srcReady(id) {
+  try { return !map.getSource(id) || map.isSourceLoaded(id); } catch (e) { return true; }
+}
+const nextFrame = () => new Promise(r => requestAnimationFrame(() => r()));
+// wartet, bis Satellitenbild, Gelände und Ortsnamen für das aktuelle Bild geladen und gezeichnet sind
+async function settle(timeout = 3000) {
+  map.triggerRepaint();
+  const t0 = performance.now();
+  await nextFrame();
+  while (performance.now() - t0 < timeout) {
+    if (srcReady("sat") && srcReady("dem") && srcReady("omt") && map.loaded()) break;
+    if (srcReady("sat") && srcReady("dem") && performance.now() - t0 > 1200) break; // Ortsnamen nicht abwarten
+    await nextFrame();
+  }
+  if (performance.now() - t0 >= timeout) settleMisses++;
+  map.triggerRepaint(); await nextFrame(); await nextFrame();
 }
 async function pickCodec(w, h) {
-  for (const codec of ["avc1.640028", "avc1.4d0028", "avc1.640033", "avc1.42003e"]) {
-    const cfg = { codec, width: w, height: h, bitrate: 10e6, framerate: FPS, avc: { format: "avc" } };
+  for (const codec of ["avc1.64001f", "avc1.640028", "avc1.4d0028", "avc1.640033", "avc1.42003e"]) {
+    const cfg = { codec, width: w, height: h, bitrate: w * h > 1e6 ? 10e6 : 6e6, framerate: FPS, avc: { format: "avc" } };
     try { if ((await VideoEncoder.isConfigSupported(cfg)).supported) return cfg; } catch (e) {}
   }
   return null;
 }
 
 async function render() {
-  if (busy) return;
+  if (busy) { cancelReq = true; status("Wird abgebrochen …"); return; }
   if (typeof VideoEncoder === "undefined") {
     status("Dieser Browser kann kein Video erzeugen. Bitte aktuelles Chrome, Edge oder Safari (iOS 16.4+) nutzen – oder die Vorschau per Bildschirmaufnahme aufnehmen.");
     return;
   }
-  busy = true; $("rec").disabled = $("play").disabled = true; $("out").hidden = true;
+  busy = true; cancelReq = false; ctxLost = false; settleMisses = 0;
+  $("play").disabled = true; $("rec").textContent = "Abbrechen"; $("out").hidden = true;
+  await keepAwake(true);
+  try { await renderInner(); }
+  catch (e) { status("Fehler: " + (e && e.message || e)); }
+  finally {
+    busy = false; await keepAwake(false);
+    $("rec").textContent = "Video erstellen"; $("rec").disabled = $("play").disabled = false;
+  }
+}
+async function renderInner() {
   const cfg = await pickCodec(OUT_W, OUT_H);
-  if (!cfg) { status("H.264-Encoder nicht verfügbar."); busy = false; $("rec").disabled = $("play").disabled = false; return; }
+  if (!cfg) { status("H.264-Encoder nicht verfügbar."); return; }
 
   computeOverview();
   const muxer = new Mp4Muxer.Muxer({ target: new Mp4Muxer.ArrayBufferTarget(),
@@ -465,27 +534,36 @@ async function render() {
   // Startansicht vorladen
   applyFrame(frameAt(0, 0)); await settle(8000);
 
+  let missStreak = 0;
   for (let f = 0; f < N; f++) {
     if (encErr) break;
+    if (cancelReq) { enc.close(); status("Abgebrochen."); setBar(0); return; }
+    if (ctxLost) throw new Error("Der Browser hat die 3D-Grafik beendet (zu wenig Speicher). Bitte 720p oder kürzere Länge wählen und neu laden.");
+    const before = settleMisses;
     const t = f / FPS;
     applyFrame(frameAt(t, 1 / FPS));
     await settle();
+    missStreak = settleMisses > before ? missStreak + 1 : 0;
     cg.drawImage(map.getCanvas(), 0, 0, OUT_W, OUT_H);
     cg.drawImage($("hud"), 0, 0);
     const vf = new VideoFrame(comp, { timestamp: Math.round(f * 1e6 / FPS), duration: Math.round(1e6 / FPS) });
     enc.encode(vf, { keyFrame: f % (FPS * 2) === 0 }); vf.close();
-    while (enc.encodeQueueSize > 4) await new Promise(r => setTimeout(r, 5));
+    const qStart = performance.now();
+    while (enc.encodeQueueSize > 4) {
+      if (performance.now() - qStart > 15000) throw new Error("Video-Encoder reagiert nicht mehr (Seite im Hintergrund oder Display aus?).");
+      await new Promise(r => setTimeout(r, 5));
+    }
     if (f % 5 === 0) {
       const el = (performance.now() - started) / 1000, rest = el / (f + 1) * (N - f - 1);
-      status(`Rendere Bild ${f + 1} von ${N} · noch ca. ${Math.ceil(rest / 60)} min`);
+      status(`Rendere Bild ${f + 1} von ${N} · noch ca. ${Math.ceil(rest / 60)} min` +
+        (missStreak > 10 ? " · Kartendaten laden langsam …" : ""));
       setBar((f + 1) / N);
     }
   }
-  if (encErr) { status("Encoder-Fehler: " + encErr.message); busy = false; $("rec").disabled = $("play").disabled = false; return; }
+  if (encErr) throw new Error("Encoder-Fehler: " + encErr.message);
   await enc.flush(); enc.close(); muxer.finalize();
   const blob = new Blob([muxer.target.buffer], { type: "video/mp4" });
   showResult(blob);
-  busy = false; $("rec").disabled = $("play").disabled = false;
 }
 
 let resultFile = null;
@@ -511,14 +589,19 @@ function setBar(f) { $("bar").style.width = (f * 100).toFixed(1) + "%"; }
 $("gpx").onchange = e => { const f = e.target.files[0]; if (f) f.text().then(loadText); };
 $("play").onclick = preview;
 $("rec").onclick = render;
-$("fmt").onchange = () => {
-  [OUT_W, OUT_H] = $("fmt").value.split("x").map(Number);
-  layoutStage(); if (route && mapReady) showRoute();
+$("fmt").onchange = $("q").onchange = () => {
+  if (busy) return;
+  setDims(); layoutStage(); if (route && mapReady) showRoute();
+};
+$("labels").onchange = () => {
+  if (map && map.getLayer("places")) map.setLayoutProperty("places", "visibility", $("labels").value === "on" ? "visible" : "none");
 };
 ["title", "sub"].forEach(id => $(id).oninput = () => drawHud(lastState));
 window.addEventListener("resize", () => { if (!busy && !playing) layoutStage(); });
 
+setDims();
 initMap();
+map.getCanvas().addEventListener("webglcontextlost", () => { ctxLost = true; });
 </script>
 </body>
 </html>
