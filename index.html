@@ -436,7 +436,7 @@ function drawHud(s) {
     g.globalAlpha = 1; g.textAlign = "left"; g.shadowBlur = 0;
   }
   g.font = font(500, 16); g.fillStyle = "rgba(255,255,255,.55)"; g.textAlign = "right";
-  g.fillText("Bilder © Esri, Maxar, Earthstar Geographics", W - pad, H - 24 * u);
+  g.fillText("Bilder © Esri, Maxar, Earthstar Geographics" + ($("labels").value === "on" ? " · Orte © OpenStreetMap" : ""), W - pad, H - 24 * u);
   g.textAlign = "left";
 }
 
